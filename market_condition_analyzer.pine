@@ -1,0 +1,352 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║           MARKET CONDITION ANALYZER — Directional Probability           ║
+// ║                                                                          ║
+// ║  Analyzes 6 market conditions to give a directional probability score:  ║
+// ║   1. Gap / Opening Context   (how today opened vs yesterday)            ║
+// ║   2. Prev Day Close Position (where did price close in PD range)        ║
+// ║   3. Prev Day Candle Type    (bullish / bearish / doji structure)       ║
+// ║   4. Trend (EMA)             (is price above or below the trend line)   ║
+// ║   5. Opening Range Breakout  (did price break above/below OR)           ║
+// ║   6. Volume Confirmation     (is high volume confirming the move)       ║
+// ║                                                                          ║
+// ║  Displays key levels: PDH, PDL, PDC, PD Mid, Opening Range H/L, EMA    ║
+// ║  Works on intraday and daily timeframes.                                 ║
+// ║  NOTE: Opening Range factor scores 0 (neutral) on daily timeframes.    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+//@version=5
+indicator("Market Condition Analyzer", shorttitle="MCA", overlay=true,
+          max_lines_count=20, max_labels_count=10)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+i_showPD    = input.bool(true,         "Show Prev Day Levels",        group="Display")
+i_showOR    = input.bool(true,         "Show Opening Range",          group="Display")
+i_showEMA   = input.bool(true,         "Show EMA",                    group="Display")
+i_showTable = input.bool(true,         "Show Probability Table",      group="Display")
+i_tblPos    = input.string("top_right","Table Position",              group="Display",
+               options=["top_right","top_left","bottom_right","bottom_left"])
+
+i_orMins    = input.int(30,            "Opening Range (minutes)",     group="Session",     minval=5,  maxval=120)
+i_maLen     = input.int(20,            "EMA Length",                  group="Indicators",  minval=5)
+i_volLen    = input.int(20,            "Volume MA Length",            group="Indicators",  minval=5)
+
+i_bullCol   = input.color(#00C853,     "Bullish Color",               group="Colors")
+i_bearCol   = input.color(#D50000,     "Bearish Color",               group="Colors")
+i_neutCol   = input.color(#FFD600,     "Neutral Color",               group="Colors")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PREVIOUS DAY DATA  (via daily security call)
+//  lookahead_on + [1] = confirmed previous day data, no repainting
+// ═══════════════════════════════════════════════════════════════════════════
+[pdH, pdL, pdC, pdO] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1], open[1]], lookahead=barmerge.lookahead_on)
+
+pdRange     = pdH - pdL
+pdMid       = (pdH + pdL) * 0.5
+pdClosePos  = pdRange > 0.0 ? (pdC - pdL) / pdRange : 0.5   // 0 = bottom, 1 = top
+pdBody      = pdC - pdO
+pdBodyRatio = pdRange > 0.0 ? math.abs(pdBody) / pdRange : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TODAY'S OPEN + OPENING RANGE TRACKING
+// ═══════════════════════════════════════════════════════════════════════════
+isNewDay = ta.change(time("D")) != 0
+
+var float todayOpen = na
+var float orHigh    = na
+var float orLow     = na
+var bool  orDone    = false
+var int   dayStart  = na
+
+if isNewDay or barstate.isfirst
+    todayOpen := open
+    orHigh    := high
+    orLow     := low
+    orDone    := false
+    dayStart  := time
+
+if not orDone and not na(dayStart)
+    minsElapsed = (time - dayStart) / 60000
+    if minsElapsed <= i_orMins
+        orHigh := math.max(nz(orHigh, high), high)
+        orLow  := math.min(nz(orLow,  low),  low)
+    else
+        orDone := true
+
+orMid = (nz(orHigh) + nz(orLow)) * 0.5
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TECHNICAL INDICATORS
+// ═══════════════════════════════════════════════════════════════════════════
+ema   = ta.ema(close, i_maLen)
+volMA = ta.sma(volume, i_volLen)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCORING FACTORS  — each factor returns a value in [-1.0, +1.0]
+//   +1.0  = strongly bullish signal
+//   +0.5  = mildly bullish signal
+//    0.0  = neutral / insufficient data
+//   -0.5  = mildly bearish signal
+//   -1.0  = strongly bearish signal
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Factor 1: Gap / Opening Context ─────────────────────────────────────
+//   Gap Up above PDH  → strong bullish continuation bias
+//   Open above PDC    → mild bullish overnight sentiment
+//   Open below PDC    → mild bearish overnight sentiment
+//   Gap Down below PDL → strong bearish continuation bias
+f_gap = todayOpen > pdH ?  1.0 :
+        todayOpen < pdL ? -1.0 :
+        todayOpen > pdC ?  0.5 :
+        todayOpen < pdC ? -0.5 : 0.0
+
+// ── Factor 2: Previous Day Close Position in Range ───────────────────────
+//   Top 33%: buyers controlled the close  → bullish
+//   Bot 33%: sellers controlled the close → bearish
+//   Middle:  indecision                   → neutral
+f_pdClose = pdClosePos >= 0.67 ?  1.0 :
+            pdClosePos <= 0.33 ? -1.0 : 0.0
+
+// ── Factor 3: Previous Day Candle Structure ──────────────────────────────
+//   Strong bull candle (body ≥60% of range) → bullish momentum carries
+//   Strong bear candle (body ≥60% of range) → bearish momentum carries
+//   Small body = indecision                  → mild bias
+f_pdCandle = pdBody > 0.0 and pdBodyRatio >= 0.60 ?  1.0 :
+             pdBody < 0.0 and pdBodyRatio >= 0.60 ? -1.0 :
+             pdBody > 0.0                          ?  0.5 :
+             pdBody < 0.0                          ? -0.5 : 0.0
+
+// ── Factor 4: Trend — Price vs EMA ──────────────────────────────────────
+//   Price above EMA → trending up  → bullish
+//   Price below EMA → trending down → bearish
+f_trend = close > ema ?  1.0 :
+          close < ema ? -1.0 : 0.0
+
+// ── Factor 5: Opening Range Position ────────────────────────────────────
+//   Broke above OR High → bullish breakout
+//   Inside upper half   → mild bullish pressure
+//   Inside lower half   → mild bearish pressure
+//   Broke below OR Low  → bearish breakdown
+//   OR still forming    → neutral (0)
+f_or = not orDone     ?  0.0 :
+       close > orHigh ?  1.0 :
+       close < orLow  ? -1.0 :
+       close > orMid  ?  0.5 :
+       close < orMid  ? -0.5 : 0.0
+
+// ── Factor 6: Volume Confirmation ───────────────────────────────────────
+//   High volume (>120% of average) in the direction of the candle
+//   confirms the move. Normal volume = neutral.
+f_vol = volume > volMA * 1.2 ?
+        (close > open ?  1.0 : close < open ? -1.0 : 0.0) :
+        0.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMPOSITE PROBABILITY SCORE
+// ═══════════════════════════════════════════════════════════════════════════
+totalScore = (f_gap + f_pdClose + f_pdCandle + f_trend + f_or + f_vol) / 6.0
+// totalScore range: -1.0 (all bearish) to +1.0 (all bullish)
+
+bullProb   = int(math.round((totalScore + 1.0) / 2.0 * 100))
+bearProb   = 100 - bullProb
+
+// Bias thresholds: ≥65% = bullish, ≤35% = bearish, else neutral
+bias    = bullProb >= 65 ? "BULLISH" : bullProb <= 35 ? "BEARISH" : "NEUTRAL"
+biasCol = bullProb >= 65 ? i_bullCol : bullProb <= 35 ? i_bearCol : i_neutCol
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOT KEY LEVELS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(i_showPD ? pdH   : na, "Prev Day High",  color=color.new(#ef5350, 20), linewidth=1)
+plot(i_showPD ? pdL   : na, "Prev Day Low",   color=color.new(#26a69a, 20), linewidth=1)
+plot(i_showPD ? pdC   : na, "Prev Day Close", color=color.new(#b0bec5, 40), linewidth=1, style=plot.style_stepline)
+plot(i_showPD ? pdMid : na, "Prev Day Mid",   color=color.new(#607d8b, 50), linewidth=1)
+plot(i_showOR ? orHigh: na, "OR High",        color=color.new(#ffa726, 10), linewidth=1)
+plot(i_showOR ? orLow : na, "OR Low",         color=color.new(#42a5f5, 10), linewidth=1)
+plot(i_showEMA ? ema  : na, "EMA",            color=color.new(#ab47bc, 40), linewidth=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS — Signal label & color from score
+// ═══════════════════════════════════════════════════════════════════════════
+f_sigStr(s) =>
+    s >= 0.75  ? "▲▲ STRONG BULL" :
+    s >= 0.25  ? "▲  BULLISH"     :
+    s <= -0.75 ? "▼▼ STRONG BEAR" :
+    s <= -0.25 ? "▼  BEARISH"     :
+                 "─  NEUTRAL"
+
+f_sigCol(s) =>
+    s > 0.0 ? i_bullCol : s < 0.0 ? i_bearCol : i_neutCol
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROBABILITY TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+tPos = i_tblPos == "top_right"    ? position.top_right    :
+       i_tblPos == "top_left"     ? position.top_left     :
+       i_tblPos == "bottom_right" ? position.bottom_right :
+       position.bottom_left
+
+// Table is created once on bar 1; cells are refreshed on the last bar
+var table tbl = table.new(tPos, 3, 14,
+                  bgcolor       = color.new(color.black, 10),
+                  border_width  = 1,
+                  border_color  = color.new(color.gray, 60),
+                  frame_width   = 2,
+                  frame_color   = color.new(color.gray, 30))
+
+if barstate.islast and i_showTable
+    // ── Color palette ─────────────────────────────────────────────────────
+    C_HEAD = color.new(#1a237e, 5)    // dark navy  — title/header rows
+    C_BIAS = color.new(#263238, 5)    // dark teal  — bias summary row
+    C_COLS = color.new(#1e2830, 20)   // dark blue  — column label row
+    C_ROW  = color.new(color.black, 20) // dark      — data rows
+    C_FOOT = color.new(#1b2631, 10)   // dark navy  — footer / key levels
+
+    // ── Row 0: Title ──────────────────────────────────────────────────────
+    tfLabel = timeframe.in_seconds() >= 86400 ? timeframe.period :
+              timeframe.period + "m"
+    table.cell(tbl, 0, 0, "MARKET CONDITION ANALYZER",
+               text_color=color.white,  text_size=size.small,  bgcolor=C_HEAD)
+    table.cell(tbl, 1, 0, "",
+               text_color=color.white,  text_size=size.small,  bgcolor=C_HEAD)
+    table.cell(tbl, 2, 0, syminfo.ticker + "  " + tfLabel,
+               text_color=color.yellow, text_size=size.small,  bgcolor=C_HEAD)
+
+    // ── Row 1: Overall Bias ───────────────────────────────────────────────
+    table.cell(tbl, 0, 1, "OVERALL BIAS",
+               text_color=color.silver, text_size=size.small,  bgcolor=C_BIAS)
+    table.cell(tbl, 1, 1, bias,
+               text_color=biasCol,      text_size=size.normal, bgcolor=C_BIAS)
+    table.cell(tbl, 2, 1, str.tostring(bullProb) + "% BULL  " +
+               str.tostring(bearProb) + "% BEAR",
+               text_color=biasCol,      text_size=size.tiny,   bgcolor=C_BIAS)
+
+    // ── Row 2: Column headers ─────────────────────────────────────────────
+    table.cell(tbl, 0, 2, "FACTOR",
+               text_color=color.gray,   text_size=size.tiny,   bgcolor=C_COLS)
+    table.cell(tbl, 1, 2, "READING",
+               text_color=color.gray,   text_size=size.tiny,   bgcolor=C_COLS)
+    table.cell(tbl, 2, 2, "SIGNAL",
+               text_color=color.gray,   text_size=size.tiny,   bgcolor=C_COLS)
+
+    // ── Row 3: Gap / Opening Context ─────────────────────────────────────
+    gapLbl = todayOpen > pdH ? "Gap Up  (above PDH)"  :
+             todayOpen < pdL ? "Gap Down (below PDL)" :
+             todayOpen > pdC ? "Open > Prev Close"    :
+                               "Open < Prev Close"
+    table.cell(tbl, 0, 3, "Gap / Open",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 3, gapLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 3, f_sigStr(f_gap),
+               text_color=f_sigCol(f_gap), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 4: Prev Day Close Position ────────────────────────────────────
+    pdCLbl = pdClosePos >= 0.67 ? "Top 33%  — Bull Close"  :
+             pdClosePos <= 0.33 ? "Bot 33%  — Bear Close"  :
+                                  "Mid Range — Neutral"
+    table.cell(tbl, 0, 4, "PD Close Pos",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 4, pdCLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 4, f_sigStr(f_pdClose),
+               text_color=f_sigCol(f_pdClose), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 5: Prev Day Candle Structure ──────────────────────────────────
+    pdCandleLbl = pdBody > 0.0 and pdBodyRatio >= 0.60 ?
+                  "Strong Bull  (" + str.tostring(math.round(pdBodyRatio * 100)) + "% body)" :
+                  pdBody < 0.0 and pdBodyRatio >= 0.60 ?
+                  "Strong Bear  (" + str.tostring(math.round(pdBodyRatio * 100)) + "% body)" :
+                  pdBody > 0.0 ? "Mild Bull Candle"  :
+                  pdBody < 0.0 ? "Mild Bear Candle"  :
+                                 "Doji / Neutral"
+    table.cell(tbl, 0, 5, "PD Candle",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 5, pdCandleLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 5, f_sigStr(f_pdCandle),
+               text_color=f_sigCol(f_pdCandle), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 6: Trend (EMA) ────────────────────────────────────────────────
+    trendLbl = close > ema ?
+               "Above EMA(" + str.tostring(i_maLen) + ")" :
+               "Below EMA(" + str.tostring(i_maLen) + ")"
+    table.cell(tbl, 0, 6, "Trend EMA",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 6, trendLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 6, f_sigStr(f_trend),
+               text_color=f_sigCol(f_trend), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 7: Opening Range ──────────────────────────────────────────────
+    orLbl = not orDone     ? "Forming (" + str.tostring(i_orMins) + " min)..." :
+            close > orHigh ? "Broke ABOVE OR — Bullish"  :
+            close < orLow  ? "Broke BELOW OR — Bearish"  :
+            close > orMid  ? "Inside — Upper Half"        :
+                              "Inside — Lower Half"
+    table.cell(tbl, 0, 7, "Open Range (" + str.tostring(i_orMins) + "m)",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 7, orLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 7, f_sigStr(f_or),
+               text_color=f_sigCol(f_or), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 8: Volume Confirmation ────────────────────────────────────────
+    volPct  = math.round(volume / volMA * 100)
+    volLbl  = volume > volMA * 1.2 ?
+              (close > open ?
+               "HIGH Vol ▲  (" + str.tostring(volPct) + "%)" :
+               "HIGH Vol ▼  (" + str.tostring(volPct) + "%)") :
+              "Normal Vol  (" + str.tostring(volPct) + "%)"
+    table.cell(tbl, 0, 8, "Volume",
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 1, 8, volLbl,
+               text_color=color.silver, text_size=size.tiny, bgcolor=C_ROW)
+    table.cell(tbl, 2, 8, f_sigStr(f_vol),
+               text_color=f_sigCol(f_vol), text_size=size.tiny, bgcolor=C_ROW)
+
+    // ── Row 9: Visual Probability Bar ─────────────────────────────────────
+    barFill = int(math.round(bullProb / 10.0))
+    barStr  = ""
+    for i = 0 to 9
+        barStr := barStr + (i < barFill ? "█" : "░")
+    table.cell(tbl, 0, 9, "Bear " + str.tostring(bearProb) + "%",
+               text_color=i_bearCol, text_size=size.tiny,  bgcolor=C_FOOT)
+    table.cell(tbl, 1, 9, barStr,
+               text_color=biasCol,   text_size=size.small, bgcolor=C_FOOT)
+    table.cell(tbl, 2, 9, str.tostring(bullProb) + "% Bull",
+               text_color=i_bullCol, text_size=size.tiny,  bgcolor=C_FOOT)
+
+    // ── Row 10: Key Levels Header ─────────────────────────────────────────
+    table.cell(tbl, 0, 10, "KEY LEVELS",
+               text_color=color.gray, text_size=size.tiny, bgcolor=C_COLS)
+    table.cell(tbl, 1, 10, "",
+               text_color=color.gray, text_size=size.tiny, bgcolor=C_COLS)
+    table.cell(tbl, 2, 10, "",
+               text_color=color.gray, text_size=size.tiny, bgcolor=C_COLS)
+
+    // ── Row 11: PDH / PD Mid / PDL ────────────────────────────────────────
+    table.cell(tbl, 0, 11, "PDH  " + str.tostring(pdH,   format.mintick),
+               text_color=color.new(#ef5350, 10), text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 1, 11, "PDM  " + str.tostring(pdMid, format.mintick),
+               text_color=color.silver,            text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 2, 11, "PDL  " + str.tostring(pdL,   format.mintick),
+               text_color=color.new(#26a69a, 10), text_size=size.tiny, bgcolor=C_FOOT)
+
+    // ── Row 12: PD Open / PD Close / PD Range ────────────────────────────
+    table.cell(tbl, 0, 12, "PDO  " + str.tostring(pdO,     format.mintick),
+               text_color=color.yellow,  text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 1, 12, "PDC  " + str.tostring(pdC,     format.mintick),
+               text_color=color.white,   text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 2, 12, "PDR  " + str.tostring(pdRange, format.mintick),
+               text_color=color.silver,  text_size=size.tiny, bgcolor=C_FOOT)
+
+    // ── Row 13: Today Open / OR High / OR Low ─────────────────────────────
+    table.cell(tbl, 0, 13, "TodO " + str.tostring(todayOpen, format.mintick),
+               text_color=color.yellow,            text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 1, 13, "ORH  " + str.tostring(orHigh,    format.mintick),
+               text_color=color.new(#ffa726, 10), text_size=size.tiny, bgcolor=C_FOOT)
+    table.cell(tbl, 2, 13, "ORL  " + str.tostring(orLow,     format.mintick),
+               text_color=color.new(#42a5f5, 10), text_size=size.tiny, bgcolor=C_FOOT)
